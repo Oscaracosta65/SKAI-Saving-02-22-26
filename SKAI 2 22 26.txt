@@ -22874,8 +22874,21 @@ function fmt(v){
         if (fldSkipGamma && typeof settings.skipGamma !== 'undefined') {
           fldSkipGamma.value = String(settings.skipGamma);
         }
-        if (fldWindowSize && typeof settings.windowSize !== 'undefined') {
-          fldWindowSize.value = String(settings.windowSize);
+        if (fldWindowSize) {
+          // skai_window_size must be the total draws analyzed (rawDraws.length),
+          // NOT settings.windowSize which is the small ML training window.
+          var _totalDraws = 0;
+          try {
+            var _rd = Array.isArray(window.__SKAI_RAW_DRAWS__) ? window.__SKAI_RAW_DRAWS__
+                      : (Array.isArray(window.draws) ? window.draws : []);
+            _totalDraws = _rd.length | 0;
+          } catch(_) {}
+          if (_totalDraws > 0) {
+            fldWindowSize.value = String(_totalDraws);
+          } else if (typeof settings.windowSize !== 'undefined') {
+            // Fallback: use settings.windowSize if draws count is unavailable
+            fldWindowSize.value = String(settings.windowSize);
+          }
         }
       }
 
@@ -36944,18 +36957,21 @@ document.addEventListener('DOMContentLoaded', function () {
       // Build the canonical snapshot from window.SKAI_SETTINGS
       var ec = (typeof window.buildEffectiveConfig === 'function') ? window.buildEffectiveConfig() : {};
 
-      // skai_window: the final effective window used for the run
-      var skaiWin = (typeof S.windowSize === 'number') ? S.windowSize : (ec.windowSize || 0);
-
-      // skip_window: same as windowSize in this codebase; bt_windows in PHP
-      var skipWin = skaiWin;
-
-      // draws_used: length of rawDraws array used by the run
+      // draws_used: total number of draws analyzed (rawDraws.length), up to ~1500.
+      // This is the primary "SKAI Window" value - how many draw records were fed into the analysis.
       var drawsUsed = 0;
       try {
         var rd = Array.isArray(window.__SKAI_RAW_DRAWS__) ? window.__SKAI_RAW_DRAWS__ : (Array.isArray(window.draws) ? window.draws : []);
         drawsUsed = rd.length | 0;
       } catch(_) {}
+
+      // skai_window: total number of draws analyzed (up to ~1500), NOT the ML sliding window.
+      // settings.windowSize is the ML training window size (a small number like 6-50).
+      // The user-facing "SKAI Window" is how many draw records were fed into the analysis.
+      var skaiWin = drawsUsed;
+
+      // skip_window: same as skai_window (total draws analyzed)
+      var skipWin = skaiWin;
 
       // auto_tune: whether the auto-tune run completed
       var autoTune = window.__SKAI_AUTOTUNE_DONE__ ? 1 : 0;
@@ -36978,7 +36994,8 @@ document.addEventListener('DOMContentLoaded', function () {
         tune_used:            tuneUsed,
         top_n_combos:         topNCombos,
         // Additional inference params from SKAI_SETTINGS (for full parity)
-        window_size:          skaiWin,
+        window_size:          drawsUsed, // total draws analyzed, same as skai_window
+        ml_window_size:       (typeof S.windowSize === 'number') ? S.windowSize : null, // ML sliding window (small)
         sampling_temperature: (typeof S.temperature      === 'number') ? S.temperature      : null,
         diversity_penalty:    (typeof S.diversityPenalty === 'number') ? S.diversityPenalty : null,
         gap_scale:            (typeof S.gapScale         === 'number') ? S.gapScale         : null,
