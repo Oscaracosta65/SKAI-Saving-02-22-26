@@ -110,6 +110,84 @@ try {
     }
 } catch (\Throwable $__) { /* ignore */ }
 
+// ============================================================
+// DESIGN B: Run-Snapshot AJAX handler
+// Receives a JSON POST from JS after skai:done fires.
+// Stores the effectiveRunConfig in the session keyed by userId+gameId.
+// Responds with JSON so JS knows the store succeeded.
+// Must run before any HTML output so that header() is still usable.
+// ============================================================
+if ($in->getMethod() === 'POST'
+    && (string)$in->getString('skai_action', '') === 'store_run_snapshot'
+    && Session::checkToken('post')
+) {
+    try { $app->setHeader('Content-Type', 'application/json; charset=utf-8', true); $app->sendHeaders(); } catch (\Throwable $_h) { @header('Content-Type: application/json; charset=utf-8'); }
+    try {
+        $snapshotUser   = Factory::getUser();
+        $snapshotUserId = (int) ($snapshotUser->id ?? 0);
+        if ($snapshotUserId <= 0) {
+            echo json_encode(['ok' => false, 'error' => 'not_logged_in']);
+            exit;
+        }
+        $rawBody = (string)$in->getString('snapshot_json', '');
+        if ($rawBody === '') {
+            echo json_encode(['ok' => false, 'error' => 'empty_snapshot']);
+            exit;
+        }
+        $snap = json_decode($rawBody, true);
+        if (!is_array($snap)) {
+            echo json_encode(['ok' => false, 'error' => 'invalid_json']);
+            exit;
+        }
+        // Validate and cast the 6 required fields
+        $snapGameId  = isset($snap['gameId'])    ? (string) $snap['gameId']    : '';
+        $skaiWin     = isset($snap['skai_window'])  ? (int)   $snap['skai_window']  : 0;
+        $skipWin     = isset($snap['skip_window'])  ? (int)   $snap['skip_window']  : 0;
+        $drawsUsed   = isset($snap['draws_used'])   ? (int)   $snap['draws_used']   : 0;
+        $atSnap      = isset($snap['auto_tune'])    ? (int) (bool) $snap['auto_tune'] : 0;
+        $tuneUsedSnap= isset($snap['tune_used'])    ? (int)   $snap['tune_used']    : 0;
+        $topNCombos  = isset($snap['top_n_combos']) ? (int)   $snap['top_n_combos'] : 0;
+        // Bounds validation
+        if ($skaiWin  < 0 || $skaiWin  > 10000) { $skaiWin  = 0; }
+        if ($skipWin  < 0 || $skipWin  > 10000) { $skipWin  = 0; }
+        if ($drawsUsed < 0 || $drawsUsed > 1000000) { $drawsUsed = 0; }
+        if ($topNCombos < 0 || $topNCombos > 10000) { $topNCombos = 0; }
+        // Build the validated snapshot
+        $validated = [
+            'gameId'      => $snapGameId,
+            'userId'      => $snapshotUserId,
+            'skai_window' => $skaiWin,
+            'skip_window' => $skipWin,
+            'draws_used'  => $drawsUsed,
+            'auto_tune'   => $atSnap,
+            'tune_used'   => $tuneUsedSnap,
+            'top_n_combos'=> $topNCombos,
+            // Additional passthrough fields for full parity
+            'sampling_temperature' => isset($snap['sampling_temperature']) ? (float)$snap['sampling_temperature'] : null,
+            'diversity_penalty'    => isset($snap['diversity_penalty'])    ? (float)$snap['diversity_penalty']    : null,
+            'gap_scale'            => isset($snap['gap_scale'])            ? (float)$snap['gap_scale']            : null,
+            'laplace_k'            => isset($snap['laplace_k'])            ? (int)  $snap['laplace_k']            : null,
+            'blend_ai_pct'         => isset($snap['blend_ai_pct'])         ? (int)  $snap['blend_ai_pct']         : null,
+            'blend_skip_pct'       => isset($snap['blend_skip_pct'])       ? (int)  $snap['blend_skip_pct']       : null,
+            'window_size'          => isset($snap['window_size'])          ? (int)  $snap['window_size']          : null,
+            'epochs'               => isset($snap['epochs'])               ? (int)  $snap['epochs']               : null,
+            'batch_size'           => isset($snap['batch_size'])           ? (int)  $snap['batch_size']           : null,
+            'risk_profile'         => isset($snap['risk_profile'])         ? preg_replace('/[^a-z0-9_\-]/i', '', (string)$snap['risk_profile']) : null,
+            'strategy'             => isset($snap['strategy'])             ? preg_replace('/[^a-z0-9_\-]/i', '', (string)$snap['strategy'])     : null,
+            'stored_at'            => time(),
+        ];
+        $sessionKey = 'skai.lastRunSnapshot.' . $snapGameId . '.' . $snapshotUserId;
+        $app->setUserState($sessionKey, $validated);
+        if (!empty($isDebug)) {
+            error_log('[SKAI SNAPSHOT STORED] uid=' . $snapshotUserId . ' gameId=' . $snapGameId . ' ' . json_encode($validated));
+        }
+        echo json_encode(['ok' => true, 'stored_at' => $validated['stored_at']]);
+    } catch (\Throwable $snapEx) {
+        echo json_encode(['ok' => false, 'error' => 'exception', 'msg' => $snapEx->getMessage()]);
+    }
+    exit;
+}
+
 
 
 // ========================================================================
@@ -4011,7 +4089,6 @@ $labelInput = implode(' - ', $parts);
         $source = (string) $in->getString('analysis_type', 'skip_hit');
         $source = preg_replace('/[^a-z0-9_\-]/i', '', $source) ?: 'skip_hit';
 
-
         // --- Optional weights (0?100), clamp safely; ignore if missing ---
         $clamp01   = static function($v){ $v=(int)$v; return max(0, min(100, $v)); };
         $freqW     = $in->getString('freq_weight', null);      $freqW     = ($freqW!==null)     ? $clamp01($freqW) : null;
@@ -4066,6 +4143,80 @@ $labelInput = implode(' - ', $parts);
                 $strategy = 'hybrid';
             }
         }
+
+        // ============================================================
+        // DESIGN B: Load effectiveRunConfig from session snapshot.
+        // The snapshot was stored by the AJAX handler (skai_action=store_run_snapshot)
+        // immediately after the JS prediction completed.
+        // If no snapshot exists, save MUST fail to prevent persisting defaults.
+        // ============================================================
+        $saveGameId       = (string) $in->getString('game_id', (string) $gameId);
+        $snapshotKey      = 'skai.lastRunSnapshot.' . $saveGameId . '.' . (int)$user->id;
+        $lastRunSnapshot  = $app->getUserState($snapshotKey, null);
+
+        if (!is_array($lastRunSnapshot) || empty($lastRunSnapshot)) {
+            if (!empty($isDebug)) {
+                error_log('[SKAI SAVE BLOCKED] missing_last_run_snapshot uid=' . (int)$user->id . ' gameId=' . $saveGameId);
+            }
+            $app->enqueueMessage('Run SKAI prediction first, then save. No recent run was found for this game.', 'warning');
+            goto SKAI_SAVE_DONE;
+        }
+
+        if (!empty($isDebug)) {
+            error_log('[SKAI SNAPSHOT LOADED] uid=' . (int)$user->id . ' gameId=' . $saveGameId . ' ' . json_encode($lastRunSnapshot));
+        }
+
+        // Override the 6 canonical target fields with authoritative snapshot values.
+        // The form POST may supply these as UI hints but the snapshot wins.
+        $skipWindow     = (int)  ($lastRunSnapshot['skip_window']  ?? $skipWindow);
+        $autoTune       = (int)  ($lastRunSnapshot['auto_tune']    ?? $autoTune);
+        $tuneUsed       = (int)  ($lastRunSnapshot['tune_used']    ?? $tuneUsed);
+        $skaiTopNCombos = (int)  ($lastRunSnapshot['top_n_combos'] ?? $skaiTopNCombos);
+        // skai_window maps to skai_window_size column; snap wins over form
+        $skaiWindowSize  = (int)($lastRunSnapshot['skai_window'] ?? $lastRunSnapshot['window_size'] ?? $skaiWindowSize);
+        // draws_used overrides the DB-derived drawsAnalyzed only when the snapshot has it
+        if (($lastRunSnapshot['draws_used'] ?? 0) > 0) {
+            $drawsAnalyzed = (int) $lastRunSnapshot['draws_used'];
+        }
+
+        // Override additional inference params from snapshot when present
+        if (isset($lastRunSnapshot['sampling_temperature'])) {
+            $samplingTemp = (string)(float) $lastRunSnapshot['sampling_temperature'];
+        }
+        if (isset($lastRunSnapshot['diversity_penalty'])) {
+            $diversityPenalty = (string)(float) $lastRunSnapshot['diversity_penalty'];
+        }
+        if (isset($lastRunSnapshot['gap_scale'])) {
+            $gapScale = (string)(float) $lastRunSnapshot['gap_scale'];
+        }
+        if (isset($lastRunSnapshot['laplace_k'])) {
+            $laplaceK = (int) $lastRunSnapshot['laplace_k'];
+        }
+        if (isset($lastRunSnapshot['blend_ai_pct'])) {
+            $skaiBlendAiPct   = (string)(int) $lastRunSnapshot['blend_ai_pct'];
+            $skaiBlendSkipPct = (string)(100 - (int) $lastRunSnapshot['blend_ai_pct']);
+        }
+        if (isset($lastRunSnapshot['epochs'])) {
+            $epochs = (int) $lastRunSnapshot['epochs'];
+        }
+        if (isset($lastRunSnapshot['batch_size'])) {
+            $batchSize = (int) $lastRunSnapshot['batch_size'];
+        }
+        if (isset($lastRunSnapshot['risk_profile'])) {
+            $snRp = preg_replace('/[^a-z0-9_\-]/i', '', (string)$lastRunSnapshot['risk_profile']);
+            if (in_array($snRp, ['balanced', 'explorative', 'conservative'], true)) {
+                $riskProfile = $snRp;
+            }
+        }
+        if (isset($lastRunSnapshot['strategy'])) {
+            $snSt = preg_replace('/[^a-z0-9_\-]/i', '', (string)$lastRunSnapshot['strategy']);
+            if (in_array($snSt, ['ai', 'hybrid', 'skip'], true)) {
+                $strategy = $snSt;
+            }
+        }
+        // ============================================================
+        // END DESIGN B snapshot overrides
+        // ============================================================
 
         // NEW: Read explicit mode component keys
         $skaiModePrimary = $in->getString('skai_mode_primary', null);
@@ -36754,4 +36905,144 @@ document.addEventListener('DOMContentLoaded', function () {
   };
 
 
+</script>
+
+<script>
+/* =====================================================================
+   DESIGN B: Run Snapshot sender
+   Purpose:
+     - After skai:done fires, collect the effectiveRunConfig from
+       window.SKAI_SETTINGS (set during the run) and POST it to the
+       server as skai_action=store_run_snapshot.
+     - The server stores it in the session keyed by userId+gameId.
+     - On Save, the server reads from this snapshot instead of form defaults.
+   Depends on:
+     - window.SKAI_SETTINGS (set in runSkaiML just before model training)
+     - window.SKAI_SERVER.csrf (CSRF token for the POST)
+     - window.SKAI_SERVER.gameId
+     - window.buildEffectiveConfig() (provides derived blend pct etc.)
+   Notes:
+     - Uses fetch() with a JSON body; gracefully no-ops if fetch is absent.
+     - Does NOT block the UI; runs fire-and-forget after skai:done.
+   ===================================================================== */
+;(function(){
+  'use strict';
+
+  if (window.__SKAI_SNAPSHOT_WIRED__) { return; }
+  window.__SKAI_SNAPSHOT_WIRED__ = true;
+
+  function sendRunSnapshot() {
+    try {
+      var S    = window.SKAI_SETTINGS || {};
+      var srv  = window.SKAI_SERVER   || {};
+      var csrf = srv.csrf             || {};
+
+      // Require CSRF name to proceed
+      var csrfName = csrf.name;
+      if (!csrfName) { return; }
+
+      // Build the canonical snapshot from window.SKAI_SETTINGS
+      var ec = (typeof window.buildEffectiveConfig === 'function') ? window.buildEffectiveConfig() : {};
+
+      // skai_window: the final effective window used for the run
+      var skaiWin = (typeof S.windowSize === 'number') ? S.windowSize : (ec.windowSize || 0);
+
+      // skip_window: same as windowSize in this codebase; bt_windows in PHP
+      var skipWin = skaiWin;
+
+      // draws_used: length of rawDraws array used by the run
+      var drawsUsed = 0;
+      try {
+        var rd = Array.isArray(window.__SKAI_RAW_DRAWS__) ? window.__SKAI_RAW_DRAWS__ : (Array.isArray(window.draws) ? window.draws : []);
+        drawsUsed = rd.length | 0;
+      } catch(_) {}
+
+      // auto_tune: whether the auto-tune run completed
+      var autoTune = window.__SKAI_AUTOTUNE_DONE__ ? 1 : 0;
+
+      // tune_used: tuned window if auto-tune ran
+      var tuneUsed = (window.__SKAI_TUNED_WINDOW__ > 0) ? (window.__SKAI_TUNED_WINDOW__ | 0) : 0;
+
+      // top_n_combos: from settings or default
+      var topNCombos = (typeof S.topCombos === 'number') ? (S.topCombos | 0) : 50;
+
+      // game_id from SKAI_SERVER
+      var gameId = String(srv.gameId || srv.lotteryId || '');
+
+      var snapshot = {
+        gameId:               gameId,
+        skai_window:          skaiWin,
+        skip_window:          skipWin,
+        draws_used:           drawsUsed,
+        auto_tune:            autoTune,
+        tune_used:            tuneUsed,
+        top_n_combos:         topNCombos,
+        // Additional inference params from SKAI_SETTINGS (for full parity)
+        window_size:          skaiWin,
+        sampling_temperature: (typeof S.temperature      === 'number') ? S.temperature      : null,
+        diversity_penalty:    (typeof S.diversityPenalty === 'number') ? S.diversityPenalty : null,
+        gap_scale:            (typeof S.gapScale         === 'number') ? S.gapScale         : null,
+        laplace_k:            (typeof S.laplaceK         === 'number') ? S.laplaceK         : null,
+        blend_ai_pct:         (typeof ec.blendAiPct      === 'number') ? ec.blendAiPct      : null,
+        blend_skip_pct:       (typeof ec.blendSkipPct    === 'number') ? ec.blendSkipPct    : null,
+        epochs:               (typeof S.epochs           === 'number') ? S.epochs           : null,
+        batch_size:           (typeof S.batchSize        === 'number') ? S.batchSize        : null,
+        risk_profile:         (function(){
+                                 var btn = document.querySelector('#skai-profile-buttons .btn-chip[aria-pressed="true"]');
+                                 return btn ? (btn.getAttribute('data-profile') || 'balanced') : 'balanced';
+                               })(),
+        strategy:             (function(){
+                                 var btn = document.querySelector('#skai-strategy-buttons .btn-chip[aria-pressed="true"]');
+                                 return btn ? (btn.getAttribute('data-strategy') || 'hybrid') : 'hybrid';
+                               })()
+      };
+
+      // Build form-encoded body (URLSearchParams is ES6 but widely supported;
+      // fall back to manual encoding for legacy browsers)
+      var body;
+      try {
+        var params = new URLSearchParams();
+        params.append('skai_action', 'store_run_snapshot');
+        params.append(csrfName, '1');
+        params.append('snapshot_json', JSON.stringify(snapshot));
+        body = params.toString();
+      } catch(_) {
+        body = 'skai_action=store_run_snapshot&' + encodeURIComponent(csrfName) + '=1&snapshot_json=' + encodeURIComponent(JSON.stringify(snapshot));
+      }
+
+      // Fire-and-forget POST to the same page URL
+      var pageUrl = (window.location && window.location.href) ? window.location.href.split('#')[0].split('?')[0] : '';
+      if (!pageUrl) { return; }
+      // Append game_id so the PHP handler can resolve it from GET
+      pageUrl = pageUrl + (pageUrl.indexOf('?') >= 0 ? '&' : '?') + 'game_id=' + encodeURIComponent(gameId);
+
+      if (typeof window.fetch === 'function') {
+        window.fetch(pageUrl, {
+          method:      'POST',
+          credentials: 'same-origin',
+          headers:     { 'Content-Type': 'application/x-www-form-urlencoded' },
+          body:        body
+        }).then(function(resp) {
+          if (window.SKAI_DEBUG_LOG) {
+            resp.json().then(function(d) {
+              console.log('[SKAI snapshotStored]', d);
+            }).catch(function(){});
+          }
+          // Mark snapshot as successfully stored so Save button can check
+          window.__SKAI_SNAPSHOT_STORED__ = true;
+        }).catch(function(err) {
+          if (window.SKAI_DEBUG_LOG) {
+            console.warn('[SKAI snapshotSendFailed]', err);
+          }
+        });
+      }
+    } catch(_) {}
+  }
+
+  // Listen for skai:done (fired when both main + extra predictions complete)
+  window.addEventListener('skai:done', function() {
+    try { sendRunSnapshot(); } catch(_) {}
+  }, false);
+
+})();
 </script>
