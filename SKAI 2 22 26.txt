@@ -4290,7 +4290,13 @@ $skaiSettings = [
         'hidden_layers'=> $hidden    ?? null,
         'recency_decay'=> $recDecay  ?? null,
     ],
-    
+
+    // Inference params (CHG: added so settings_json is a complete record matching individual columns)
+    'sampling_temperature' => $samplingTemp    ?? null,
+    'diversity_penalty'    => $diversityPenalty ?? null,
+    'gap_scale'            => $gapScale         ?? null,
+    'skip_gamma'           => null, // no dedicated DB col; tracked via blend
+
     // Digit game specifics
     'digit_game' => [
         'pick_length' => $pickLength ?? null,
@@ -22802,9 +22808,11 @@ function fmt(v){
       } catch(_) {}
 
       // Build descriptive summary
+      // CHG: Use _summaryAiPct (not aiPct) to avoid overwriting the effective-config aiPct
+      // computed at the start of this function from buildEffectiveConfig()/SKAI_SETTINGS.
       var blendSlider = document.getElementById('skai-blend-range');
-      var aiPct = blendSlider ? (parseInt(blendSlider.value, 10) || 55) : 55;
-      var skipPct = 100 - aiPct;
+      var _summaryAiPct = (typeof aiPct === 'number') ? aiPct : (blendSlider ? (parseInt(blendSlider.value, 10) || 55) : 55);
+      var _summarySkipPct = 100 - _summaryAiPct;
 
       var topNNums = mainNumbers ? mainNumbers.length : 20;
       var topNCombos = (settings && settings.topCombos) ? settings.topCombos : 50;
@@ -22812,7 +22820,7 @@ function fmt(v){
       var summaryParts = [
         'Mode: ' + profileLabel,
         'Strategy: ' + strategyLabel,
-        'Blend: Skip ' + skipPct + '% / AI ' + aiPct + '%'
+        'Blend: Skip ' + _summarySkipPct + '% / AI ' + _summaryAiPct + '%'
       ];
 
       if (windowSize) {
@@ -22844,8 +22852,8 @@ function fmt(v){
         version: 1,
         profile: profileVal,
         strategy: strategyVal,
-        blend_ai_pct: aiPct,
-        blend_skip_pct: skipPct,
+        blend_ai_pct: _summaryAiPct,
+        blend_skip_pct: _summarySkipPct,
         summary: summary,
         window_size: windowSize,
         auto_tune: autoTuneStatus === 'On' ? 1 : 0,
@@ -22854,15 +22862,21 @@ function fmt(v){
         top_n_combos: topNCombos
       };
 
-      // Add NN params if available
+      // Add NN params and inference params from SKAI_SETTINGS using correct internal key names.
+      // CHG: settings object uses dropout/lr/layers internally (not dropoutRate/learningRate/hiddenLayers).
       if (settings) {
-        if (settings.epochs) comprehensiveSettings.epochs = settings.epochs;
-        if (settings.batchSize) comprehensiveSettings.batch_size = settings.batchSize;
-        if (settings.dropoutRate) comprehensiveSettings.dropout_rate = settings.dropoutRate;
-        if (settings.learningRate) comprehensiveSettings.learning_rate = settings.learningRate;
-        if (settings.activationFunction) comprehensiveSettings.activation_function = settings.activationFunction;
-        if (settings.hiddenLayers) comprehensiveSettings.hidden_layers = settings.hiddenLayers;
-        if (settings.laplaceK) comprehensiveSettings.laplace_k = settings.laplaceK;
+        if (settings.epochs    != null) comprehensiveSettings.epochs              = settings.epochs;
+        if (settings.batchSize != null) comprehensiveSettings.batch_size          = settings.batchSize;
+        if (settings.dropout   != null) comprehensiveSettings.dropout_rate        = settings.dropout;
+        if (settings.lr        != null) comprehensiveSettings.learning_rate       = settings.lr;
+        if (settings.layers    != null) comprehensiveSettings.hidden_layers       = settings.layers;
+        if (settings.recencyDecay != null) comprehensiveSettings.recency_decay    = settings.recencyDecay;
+        if (settings.laplaceK  != null) comprehensiveSettings.laplace_k           = settings.laplaceK;
+        // CHG: Add temperature and diversityPenalty (now present in SKAI_SETTINGS after fix)
+        if (settings.temperature      != null) comprehensiveSettings.temperature       = settings.temperature;
+        if (settings.diversityPenalty != null) comprehensiveSettings.diversity_penalty = settings.diversityPenalty;
+        if (settings.gapScale         != null) comprehensiveSettings.gap_scale         = settings.gapScale;
+        if (settings.skipGamma        != null) comprehensiveSettings.skip_gamma        = settings.skipGamma;
       }
 
       // Detect digit game (Pick3/Pick4/Daily)
