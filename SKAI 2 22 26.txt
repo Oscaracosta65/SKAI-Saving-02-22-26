@@ -3748,6 +3748,25 @@ try {
         && Session::checkToken();
 
     if ($doSave && !empty($saveable) && (int)$user->id > 0) {
+        // CHG: Instrumentation log at save entry (guarded by $isDebug).
+        if (!empty($isDebug)) {
+            error_log(sprintf(
+                '[SKAI SAVE ENTRY] requestMethod=%s getKeys=%s postKeys=%s analysis_type=%s blend_ai_pct=%s temperature=%s diversity_penalty=%s gap_scale=%s laplace_k=%s skip_gamma=%s window_size=%s epochs=%s batch_size=%s',
+                $in->getMethod(),
+                implode(',', array_keys($_GET)),
+                implode(',', array_keys($_POST)),
+                $in->getString('analysis_type', ''),
+                $in->getString('skai_blend_ai_pct', ''),
+                $in->getString('sampling_temperature', ''),
+                $in->getString('diversity_penalty', ''),
+                $in->getString('gap_scale', ''),
+                $in->getString('laplace_k', ''),
+                $in->getString('skip_gamma', ''),
+                $in->getString('skai_window_size', ''),
+                $in->getString('epochs', ''),
+                $in->getString('batch_size', '')
+            ));
+        }
         // Read posted payloads
         $numbersJson = (string) $in->getString('numbers_json', '');
         $evidenceJson= (string) $in->getString('top_combos_json', '');
@@ -4561,7 +4580,7 @@ $row = (object) [
         $newId = 0;
         try { $newId = (int) $db->insertid(); } catch (\Throwable $__) {}
         
-        // CHG: Instrumentation log
+        // CHG: Instrumentation log - persisted config (guarded by $isDebug)
         if (!empty($isDebug)) {
             error_log(sprintf(
                 '[SKAI SAVE SUCCESS] id=%d uid=%d lotId=%d src=%s profile=%s strategy=%s gameType=%s pickLen=%s',
@@ -4574,6 +4593,24 @@ $row = (object) [
                 ($pickLength && $pickLength <= 9) ? 'digit' : 'standard',
                 $pickLength ?? 'none'
             ));
+            // CHG: Log the full persisted config for mismatch audit
+            error_log('[SKAI persistedConfig] ' . json_encode([
+                'id'                   => $newId,
+                'sampling_temperature' => $samplingTemp       ?? null,
+                'diversity_penalty'    => $diversityPenalty   ?? null,
+                'gap_scale'            => $gapScale           ?? null,
+                'laplace_k'            => $laplaceK           ?? null,
+                'skip_gamma'           => ($skaiBlendSkipPct  ?? null), // skip_gamma not a separate col; log blend
+                'skai_blend_ai_pct'    => $skaiBlendAiPct     ?? null,
+                'skai_blend_skip_pct'  => $skaiBlendSkipPct   ?? null,
+                'skai_window_size'     => $skaiWindowSize     ?? null,
+                'epochs'               => $epochs             ?? null,
+                'batch_size'           => $batchSize          ?? null,
+                'risk_profile'         => $riskProfile        ?? null,
+                'strategy'             => $strategy           ?? null,
+                'skai_run_mode'        => $skaiRunMode        ?? null,
+                'settings_json_sample' => substr($skaiSettingsJson ?? '', 0, 300),
+            ]));
         }
         
         $app->enqueueMessage('Saved to your dashboard.', 'message');
@@ -22505,6 +22542,37 @@ function fmt(v){
       }
     }
 
+    window.buildEffectiveConfig = function() {
+      var s = (typeof window.SKAI_SETTINGS !== 'undefined' && window.SKAI_SETTINGS) ? window.SKAI_SETTINGS : {};
+      // Derive blend pct from SKAI_SETTINGS.blend (0-1 runtime value) when available,
+      // fall back to slider for first-run (before SKAI_SETTINGS is set).
+      var blendRaw = (typeof s.blend === 'number' && isFinite(s.blend)) ? s.blend : null;
+      var aiPct    = 40; // default
+      if (blendRaw !== null) {
+        // SKAI_SETTINGS.blend is always 0-1; convert to integer percentage
+        aiPct = Math.round(blendRaw * 100);
+      } else {
+        var _slider = document.getElementById('skai-blend-range');
+        if (_slider && _slider.value !== '') { aiPct = parseInt(_slider.value, 10) || 40; }
+      }
+      return {
+        epochs:           (typeof s.epochs          === 'number') ? s.epochs          : null,
+        batchSize:        (typeof s.batchSize        === 'number') ? s.batchSize        : null,
+        dropoutRate:      (typeof s.dropout          === 'number') ? s.dropout          : null,
+        learningRate:     (typeof s.lr               === 'number') ? s.lr               : null,
+        hiddenLayers:     (typeof s.layers           === 'number') ? s.layers           : null,
+        recencyDecay:     (typeof s.recencyDecay     === 'number') ? s.recencyDecay     : null,
+        blendAiPct:       aiPct,
+        blendSkipPct:     100 - aiPct,
+        gapScale:         (typeof s.gapScale         === 'number') ? s.gapScale         : null,
+        laplaceK:         (typeof s.laplaceK         === 'number') ? s.laplaceK         : null,
+        skipGamma:        (typeof s.skipGamma        === 'number') ? s.skipGamma        : null,
+        windowSize:       (typeof s.windowSize       === 'number') ? s.windowSize       : null,
+        temperature:      (typeof s.temperature      === 'number') ? s.temperature      : null,
+        diversityPenalty: (typeof s.diversityPenalty === 'number') ? s.diversityPenalty : null
+      };
+    };
+
     window.skaiPrepareAiSave = function (options) {
       options = options || {};
 
@@ -22617,10 +22685,14 @@ function fmt(v){
       var fldTopNNumbers = document.getElementById('skai-ai-top-n-numbers');
       var fldTopNCombos = document.getElementById('skai-ai-top-n-combos');
 
-      // Get blend values from slider (0-100%)
-      var blendSlider = document.getElementById('skai-blend-range');
-      if (blendSlider && fldBlendAiPct && fldBlendSkipPct) {
-        var aiPct = parseInt(blendSlider.value, 10) || 40;
+      // Get blend values from effective config (SKAI_SETTINGS.blend converted to pct),
+      // falling back to slider only when SKAI_SETTINGS is not yet populated.
+      var _eff = (typeof window.buildEffectiveConfig === 'function') ? window.buildEffectiveConfig() : {};
+      if (fldBlendAiPct && fldBlendSkipPct) {
+        var aiPct = (typeof _eff.blendAiPct === 'number') ? _eff.blendAiPct : (function(){
+          var sl = document.getElementById('skai-blend-range');
+          return (sl && sl.value !== '') ? (parseInt(sl.value, 10) || 40) : 40;
+        })();
         fldBlendAiPct.value = String(aiPct);
         fldBlendSkipPct.value = String(100 - aiPct);
       }
@@ -22628,9 +22700,10 @@ function fmt(v){
       // Get values from window.SKAI_SETTINGS if available
       if (typeof window.SKAI_SETTINGS !== 'undefined' && window.SKAI_SETTINGS) {
         var settings = window.SKAI_SETTINGS;
-        
-        if (fldSamplingTemp && typeof settings.gap !== 'undefined') {
-          fldSamplingTemp.value = String(settings.gap);
+        // CHG: map sampling_temperature from settings.temperature (the actual temperature
+        // parameter used at inference), NOT from settings.gap which is gapScale alias.
+        if (fldSamplingTemp && typeof settings.temperature !== 'undefined') {
+          fldSamplingTemp.value = String(settings.temperature);
         }
         if (fldDiversityPenalty && typeof settings.diversityPenalty !== 'undefined') {
           fldDiversityPenalty.value = String(settings.diversityPenalty);
@@ -22825,6 +22898,33 @@ function fmt(v){
       if (settingsJsonField) {
         settingsJsonField.value = JSON.stringify(comprehensiveSettings);
       }
+
+      // CHG: Log save payload for instrumentation (debug flag guard).
+      try {
+        if (window.SKAI_DEBUG_LOG) {
+          var _saveLog = {
+            savePayloadConfig: {
+              sampling_temperature: fldSamplingTemp ? fldSamplingTemp.value : null,
+              diversity_penalty:    fldDiversityPenalty ? fldDiversityPenalty.value : null,
+              gap_scale:            fldGapScale ? fldGapScale.value : null,
+              laplace_k:            fldLaplaceK ? fldLaplaceK.value : null,
+              skip_gamma:           fldSkipGamma ? fldSkipGamma.value : null,
+              skai_window_size:     fldWindowSize ? fldWindowSize.value : null,
+              skai_blend_ai_pct:    fldBlendAiPct ? fldBlendAiPct.value : null,
+              skai_blend_skip_pct:  fldBlendSkipPct ? fldBlendSkipPct.value : null,
+              epochs:               fldEpochs ? fldEpochs.value : null,
+              batch_size:           fldBatchSize ? fldBatchSize.value : null,
+              dropout_rate:         fldDropout ? fldDropout.value : null,
+              learning_rate:        fldLr ? fldLr.value : null,
+              activation_function:  fldActivation ? fldActivation.value : null,
+              hidden_layers:        fldLayers ? fldLayers.value : null,
+              recency_decay:        fldRecencyDecay ? fldRecencyDecay.value : null
+            },
+            persistedConfig: comprehensiveSettings
+          };
+          console.log('[SKAI savePayloadConfig]', JSON.stringify(_saveLog));
+        }
+      } catch(_) {}
 
       if (btnSave) {
         btnSave.disabled = false;
@@ -26540,7 +26640,24 @@ if (typeof window.runSkaiML !== 'function') { // singleton guard to avoid redefi
                       .map(function(s){ return parseFloat(s.trim()); })
                       .filter(function(x){ return isFinite(x); }),
     useGateMeta: true,
-    calibrateTemp: true
+    calibrateTemp: true,
+    // CHG: Capture temperature and diversityPenalty from DOM so they are part of
+    // the canonical settings object stored in window.SKAI_SETTINGS.
+    // Previously these were read directly from the DOM at inference time and were
+    // never persisted to SKAI_SETTINGS, causing a mismatch with the saved record.
+    temperature:      (function(){
+                         var v = parseFloat(gv('temperature', '0.85'));
+                         if (!isFinite(v) || v <= 0) v = 0.85;
+                         if (v < 0.25) v = 0.25;
+                         if (v > 4.0) v = 4.0;
+                         return v;
+                       })(),
+    diversityPenalty: (function(){
+                         var v = parseFloat(gv('diversityPenalty', '0.02'));
+                         if (!isFinite(v) || v < 0) v = 0.02;
+                         if (v > 0.5) v = 0.5;
+                         return v;
+                       })()
   };
 
   // Enforce tuned window if present
@@ -26558,6 +26675,30 @@ if (typeof window.runSkaiML !== 'function') { // singleton guard to avoid redefi
   })();
 
   // Data prep begin / done
+  // CHG: Log effective run config immediately before the dataset build (debug flag guard).
+  try {
+    if (window.SKAI_DEBUG_LOG) {
+      var _runLog = {
+        requestMethod: 'GET',
+        effectiveRunConfig: {
+          epochs:           settings.epochs,
+          batchSize:        settings.batchSize,
+          dropout:          settings.dropout,
+          lr:               settings.lr,
+          layers:           settings.layers,
+          recencyDecay:     settings.recencyDecay,
+          blend:            settings.blend,
+          gapScale:         settings.gapScale,
+          laplaceK:         settings.laplaceK,
+          skipGamma:        settings.skipGamma,
+          windowSize:       settings.windowSize,
+          temperature:      settings.temperature,
+          diversityPenalty: settings.diversityPenalty
+        }
+      };
+      console.log('[SKAI effectiveRunConfig]', JSON.stringify(_runLog));
+    }
+  } catch(_) {}
   try { window.dispatchEvent(new Event('skai:dataprep:begin')); } catch(_){}
   /* CHG: var instead of const.
      Reason: ES5 compatibility.
@@ -29954,7 +30095,12 @@ try {
         return;
       }
 
-      // Optional SKAI parameter source – your SKAI engine can set this object
+      // Optional SKAI parameter source: prefer buildEffectiveConfig() (reads from
+      // window.SKAI_SETTINGS, the authoritative runtime config) over window.skaiConfig
+      // (which only contains NN params set inside fitWithValidation).
+      // CHG: This is the fix for the mismatch - pass the same canonical config object
+      // that was used for the run to the save helper, not just NN params.
+      var _ec = (typeof window.buildEffectiveConfig === 'function') ? window.buildEffectiveConfig() : {};
       var cfg = window.skaiConfig || {};
 
       // Call the canonical helper to populate all hidden fields (numbers + params)
@@ -29968,14 +30114,14 @@ try {
         topCombosJson: null,
         drawsAnalyzed: (typeof cfg.drawsAnalyzed === 'number') ? cfg.drawsAnalyzed : 0,
 
-        // SKAI / NN hyperparameters – only applied if defined
-        epochs: cfg.epochs,
-        batchSize: cfg.batchSize,
-        dropoutRate: cfg.dropoutRate,
-        learningRate: cfg.learningRate,
-        activationFunction: cfg.activationFunction,
-        hiddenLayers: cfg.hiddenLayers,
-        recencyDecay: cfg.recencyDecay
+        // SKAI / NN hyperparameters - prefer effective config, fall back to skaiConfig
+        epochs:              (_ec.epochs           != null) ? _ec.epochs           : cfg.epochs,
+        batchSize:           (_ec.batchSize         != null) ? _ec.batchSize         : cfg.batchSize,
+        dropoutRate:         (_ec.dropoutRate        != null) ? _ec.dropoutRate        : cfg.dropoutRate,
+        learningRate:        (_ec.learningRate       != null) ? _ec.learningRate       : cfg.learningRate,
+        activationFunction:  (_ec.activationFunction != null) ? _ec.activationFunction : cfg.activationFunction,
+        hiddenLayers:        (_ec.hiddenLayers        != null) ? _ec.hiddenLayers        : cfg.hiddenLayers,
+        recencyDecay:        (_ec.recencyDecay        != null) ? _ec.recencyDecay        : cfg.recencyDecay
       });
     });
   }
